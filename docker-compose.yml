@@ -1,0 +1,9 @@
+version: '3.8'
+
+services:
+  mijia:
+    image: mijia:latest
+    container_name: mijia
+    ports:
+      - "8010:8010"
+    restart: unless-stopped
