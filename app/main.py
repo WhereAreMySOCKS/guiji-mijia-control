@@ -122,18 +122,24 @@ def _mock_devices() -> list[dict[str, Any]]:
             "model": "chuangmi.plug.mock",
             "room_name": "阳台",
             "device_kind": "plug",
-            "capabilities": {"power": {"siid": 2, "piid": 1}},
+            "capabilities": {"power": {"siid": 2, "piid": 1}, "_meta": {"supports_wifi": True}},
+            "supports_wifi": True,
             "online_status": "online",
             "last_state": {"power": "off"},
             "last_seen_at": now_utc().isoformat(),
         },
         {
             "external_device_id": "mock-temp-001",
-            "name": "主缸温湿度计",
-            "model": "miaomiaoce.sensor_ht.mock",
+            "name": "主缸 Wi-Fi 温度计",
+            "model": "mijia.sensor_ht.wifi.mock",
             "room_name": "阳台",
             "device_kind": "temperature_sensor",
-            "capabilities": {"temperature": {"siid": 2, "piid": 1}, "humidity": {"siid": 2, "piid": 2}},
+            "capabilities": {
+                "temperature": {"siid": 2, "piid": 1},
+                "humidity": {"siid": 2, "piid": 2},
+                "_meta": {"supports_wifi": True},
+            },
+            "supports_wifi": True,
             "online_status": "online",
             "last_state": {"temperature": 26.4, "humidity": 68},
             "last_seen_at": now_utc().isoformat(),
@@ -170,6 +176,81 @@ def _classify_device(raw: dict[str, Any], spec: dict[str, Any] | None = None) ->
     if "humidity" in capabilities or "湿度" in name:
         return "humidity_sensor", capabilities
     return "unknown", capabilities
+
+
+def _bool_value(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "y", "wifi", "wi-fi"}:
+            return True
+        if text in {"0", "false", "no", "n", "ble", "bluetooth", "zigbee"}:
+            return False
+    return None
+
+
+def _has_non_empty_field(raw: dict[str, Any], keys: tuple[str, ...]) -> bool:
+    for key in keys:
+        value = raw.get(key)
+        if value is not None and str(value).strip() not in {"", "0", "none", "null"}:
+            return True
+    return False
+
+
+def _supports_wifi(raw: dict[str, Any], kind: str) -> bool | None:
+    explicit_keys = (
+        "supports_wifi",
+        "support_wifi",
+        "is_wifi",
+        "isWifi",
+        "wifi",
+        "wlan",
+        "supportWiFi",
+        "support_wlan",
+    )
+    for key in explicit_keys:
+        parsed = _bool_value(raw.get(key))
+        if parsed is not None:
+            return parsed
+
+    text = " ".join(
+        str(raw.get(key) or "").lower()
+        for key in (
+            "did",
+            "name",
+            "model",
+            "conn_type",
+            "connection_type",
+            "connect_type",
+            "net_type",
+            "network_type",
+            "protocol",
+            "communication_protocol",
+        )
+    )
+    if "wifi" in text or "wi-fi" in text or "wlan" in text:
+        return True
+
+    if _has_non_empty_field(raw, ("ssid", "bssid", "localip", "local_ip", "ip", "token")):
+        return True
+
+    if _has_non_empty_field(raw, ("parent_id", "parent_did", "parentDid", "gateway_id", "gateway_did", "gatewayDid")):
+        return False
+
+    non_wifi_markers = ("blt.", "ble", "bluetooth", "zigbee", "lumi.", "aqara.", "miaomiaoce.sensor_ht", "cgllc.sensor_ht")
+    if any(marker in text for marker in non_wifi_markers):
+        return False
+
+    if kind == "plug":
+        return True
+    return None
+
+
+def _is_displayable_wifi_device(kind: str, supports_wifi: bool | None) -> bool:
+    return kind in {"plug", "temperature_sensor"} and supports_wifi is not False
 
 
 def _activate_session_from_auth(session_id: str, api, auth_path: Path, message: str) -> None:
@@ -308,6 +389,10 @@ async def list_devices(req: DeviceListRequest):
                 with contextlib.suppress(Exception):
                     spec = api.get_device_info(model)
             kind, capabilities = _classify_device(raw, spec)
+            supports_wifi = _supports_wifi(raw, kind)
+            if not _is_displayable_wifi_device(kind, supports_wifi):
+                continue
+            capabilities["_meta"] = {"supports_wifi": supports_wifi is not False}
             normalized.append(
                 {
                     "external_device_id": raw.get("did"),
@@ -316,6 +401,7 @@ async def list_devices(req: DeviceListRequest):
                     "room_name": raw.get("room_name") or raw.get("room"),
                     "device_kind": kind,
                     "capabilities": capabilities,
+                    "supports_wifi": supports_wifi is not False,
                     "online_status": "online" if raw.get("isOnline", True) else "offline",
                     "last_state": {},
                     "last_seen_at": now_utc().isoformat(),
@@ -350,24 +436,43 @@ async def control_device(req: ControlRequest):
 @app.post("/devices/state")
 async def get_device_state(req: StateRequest):
     if MOCK_ENABLED or req.credentials.get("mock"):
-        return {"power": "off", "online_status": "online", "mock": True}
+        return {"power": "off", "temperature": 26.4, "humidity": 68, "online_status": "online", "mock": True}
 
-    power = req.capabilities.get("power") or {"siid": 2, "piid": 1}
+    props = []
+    prop_names = []
+    has_sensor_capability = "temperature" in req.capabilities or "humidity" in req.capabilities
+    for name in ("power", "temperature", "humidity"):
+        capability = req.capabilities.get(name)
+        if not capability and name == "power" and not has_sensor_capability:
+            capability = {"siid": 2, "piid": 1}
+        if not capability:
+            continue
+        props.append(
+            {
+                "did": req.did,
+                "siid": int(capability.get("siid", 2)),
+                "piid": int(capability.get("piid", 1)),
+            }
+        )
+        prop_names.append(name)
+    if not props:
+        props = [{"did": req.did, "siid": 2, "piid": 1}]
+        prop_names = ["power"]
+
     api = _build_api(req.credentials)
     try:
-        result = api.get_devices_prop(
-            [
-                {
-                    "did": req.did,
-                    "siid": int(power.get("siid", 2)),
-                    "piid": int(power.get("piid", 1)),
-                }
-            ]
-        )
-        value = None
-        if isinstance(result, list) and result:
-            value = result[0].get("value")
-        return {"power": "on" if value is True else "off" if value is False else "unknown", "provider_result": result}
+        result = api.get_devices_prop(props)
+        response = {"online_status": "online", "provider_result": result}
+        if isinstance(result, list):
+            for name, item in zip(prop_names, result):
+                value = item.get("value") if isinstance(item, dict) else None
+                if name == "power":
+                    response["power"] = "on" if value is True else "off" if value is False else "unknown"
+                elif name in {"temperature", "humidity"}:
+                    with contextlib.suppress(TypeError, ValueError):
+                        response[name] = float(value)
+        response.setdefault("power", "unknown")
+        return response
     finally:
         _cleanup_runtime_auth(api)
 
