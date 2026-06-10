@@ -47,6 +47,10 @@ class StateRequest(CredentialsPayload):
     capabilities: dict[str, Any] = Field(default_factory=dict)
 
 
+class BatchStateRequest(CredentialsPayload):
+    devices: list[dict[str, Any]] = Field(default_factory=list)
+
+
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -147,9 +151,25 @@ def _mock_devices() -> list[dict[str, Any]]:
     ]
 
 
+def _is_ble_device(raw: dict[str, Any]) -> bool:
+    """Detect BLE/Zigbee devices (not Wi-Fi connected).
+
+    BLE devices have DID starting with 'blt.' and use different property ID
+    ranges (piid 1001+) compared to Wi-Fi devices (piid 1+).
+    """
+    did = str(raw.get("did") or raw.get("external_device_id") or "")
+    if did.startswith("blt.") or did.startswith("ble."):
+        return True
+    model = str(raw.get("model") or "").lower()
+    # Known BLE-only sensor models
+    ble_models = ("miaomiaoce.sensor_ht", "cgllc.sensor_ht", "vchon.sensor_ht")
+    return any(m in model for m in ble_models)
+
+
 def _classify_device(raw: dict[str, Any], spec: dict[str, Any] | None = None) -> tuple[str, dict[str, Any]]:
     name = str(raw.get("name") or "").lower()
     model = str(raw.get("model") or "").lower()
+    is_ble = _is_ble_device(raw)
     capabilities: dict[str, Any] = {}
 
     services = []
@@ -167,15 +187,85 @@ def _classify_device(raw: dict[str, Any], spec: dict[str, Any] | None = None) ->
                 capabilities["temperature"] = {"siid": siid, "piid": piid}
             if "humidity" in prop_type:
                 capabilities["humidity"] = {"siid": siid, "piid": piid}
+    # Fallback: use flattened spec.properties list (from patched get_device_info)
+    if not capabilities and spec:
+        for prop in (spec.get("properties") or []):
+            method = prop.get("method")
+            if not method:
+                continue
+            siid = method.get("siid")
+            piid = method.get("piid")
+            prop_type = str(prop.get("name") or "").lower()
+            if "temperature" in prop_type:
+                capabilities.setdefault("temperature", {"siid": siid, "piid": piid})
+            if "humidity" in prop_type:
+                capabilities.setdefault("humidity", {"siid": siid, "piid": piid})
+
+    # BLE sensors use piid 1001+ range (e.g. vchon.sensor_ht.mbs17: temp=1001, hum=1002)
+    ble_temp_piid = 1001
+    ble_hum_piid = 1002
 
     if "power" in capabilities or "plug" in model or "插座" in name:
         capabilities.setdefault("power", {"siid": 2, "piid": 1})
         return "plug", capabilities
     if "temperature" in capabilities or "sensor_ht" in model or "温湿" in name or "温度" in name:
+        capabilities.setdefault("temperature", {"siid": 2, "piid": ble_temp_piid if is_ble else 1})
+        capabilities.setdefault("humidity", {"siid": 2, "piid": ble_hum_piid if is_ble else 2})
         return "temperature_sensor", capabilities
     if "humidity" in capabilities or "湿度" in name:
+        capabilities.setdefault("humidity", {"siid": 2, "piid": 1})
         return "humidity_sensor", capabilities
     return "unknown", capabilities
+
+
+def _retry_sensor_piid(
+    req: StateRequest,
+    prop_names: list[str],
+    props: list[dict[str, Any]],
+    response: dict[str, Any],
+    api,
+) -> None:
+    """Retry temperature/humidity queries with BLE-common piid range.
+
+    BLE sensors (e.g. vchon.sensor_ht.mbs17) use piid 1001+ instead of the
+    Wi-Fi-device defaults (piid 1/2).  When the initial query returned no value
+    for a sensor property, try the higher range.
+    """
+    missing: list[tuple[int, str, int]] = []  # (prop_index, name, siid)
+    for i, name in enumerate(prop_names):
+        if name in ("temperature", "humidity") and response.get(name) is None:
+            orig_piid = props[i]["piid"]
+            if orig_piid < 100:  # likely a Wi-Fi-default, try BLE range
+                missing.append((i, name, props[i]["siid"]))
+
+    if not missing:
+        return
+
+    retry_props: list[dict[str, Any]] = []
+    retry_map: list[tuple[str, int]] = []  # (name, candidate_piid)
+    for _orig_idx, name, siid in missing:
+        # Temperature: try 1001, 1003, 1005.  Humidity: try 1002, 1004, 1006.
+        base = 1001 if name == "temperature" else 1002
+        for candidate_piid in (base, base + 2, base + 4):
+            retry_props.append({"did": req.did, "siid": siid, "piid": candidate_piid})
+            retry_map.append((name, candidate_piid))
+
+    try:
+        retry_result = api.get_devices_prop(retry_props)
+    except Exception:
+        return
+
+    if not isinstance(retry_result, list):
+        return
+
+    for (name, _candidate_piid), item in zip(retry_map, retry_result):
+        if response.get(name) is not None:
+            continue  # already filled by earlier candidate
+        value = item.get("value") if isinstance(item, dict) else None
+        code = item.get("code") if isinstance(item, dict) else None
+        if value is not None and code is None:
+            with contextlib.suppress(TypeError, ValueError):
+                response[name] = float(value)
 
 
 def _bool_value(value: Any) -> bool | None:
@@ -247,10 +337,6 @@ def _supports_wifi(raw: dict[str, Any], kind: str) -> bool | None:
     if kind == "plug":
         return True
     return None
-
-
-def _is_displayable_wifi_device(kind: str, supports_wifi: bool | None) -> bool:
-    return kind in {"plug", "temperature_sensor"} and supports_wifi is not False
 
 
 def _activate_session_from_auth(session_id: str, api, auth_path: Path, message: str) -> None:
@@ -390,8 +476,6 @@ async def list_devices(req: DeviceListRequest):
                     spec = api.get_device_info(model)
             kind, capabilities = _classify_device(raw, spec)
             supports_wifi = _supports_wifi(raw, kind)
-            if not _is_displayable_wifi_device(kind, supports_wifi):
-                continue
             capabilities["_meta"] = {"supports_wifi": supports_wifi is not False}
             normalized.append(
                 {
@@ -441,10 +525,16 @@ async def get_device_state(req: StateRequest):
     props = []
     prop_names = []
     has_sensor_capability = "temperature" in req.capabilities or "humidity" in req.capabilities
+    has_power_capability = "power" in req.capabilities
     for name in ("power", "temperature", "humidity"):
         capability = req.capabilities.get(name)
-        if not capability and name == "power" and not has_sensor_capability:
-            capability = {"siid": 2, "piid": 1}
+        if not capability:
+            if name == "power" and not has_sensor_capability:
+                capability = {"siid": 2, "piid": 1}
+            elif name == "temperature" and not has_power_capability:
+                capability = {"siid": 2, "piid": 1}
+            elif name == "humidity" and not has_power_capability:
+                capability = {"siid": 2, "piid": 2}
         if not capability:
             continue
         props.append(
@@ -471,8 +561,96 @@ async def get_device_state(req: StateRequest):
                 elif name in {"temperature", "humidity"}:
                     with contextlib.suppress(TypeError, ValueError):
                         response[name] = float(value)
+
+        # Auto-discover: if temperature/humidity returned no value with a low
+        # piid (1-10), retry with BLE-common piid range (1001-1006).
+        _retry_sensor_piid(req, prop_names, props, response, api)
+
         response.setdefault("power", "unknown")
         return response
+    finally:
+        _cleanup_runtime_auth(api)
+
+
+@app.post("/devices/batch-state")
+async def get_devices_batch_state(req: BatchStateRequest):
+    if MOCK_ENABLED or req.credentials.get("mock"):
+        results = []
+        for d in req.devices:
+            did = d.get("did", "")
+            caps = d.get("capabilities", {})
+            if "temperature" in caps or "humidity" in caps:
+                results.append(
+                    {
+                        "did": did,
+                        "temperature": 26.4,
+                        "humidity": 68,
+                        "online_status": "online",
+                    }
+                )
+            else:
+                results.append({"did": did, "power": "off", "online_status": "online"})
+        return {"results": results}
+
+    api = _build_api(req.credentials)
+    try:
+        results = []
+        for d in req.devices:
+            did = d.get("did")
+            caps = d.get("capabilities", {})
+            try:
+                props = []
+                prop_names = []
+                has_sensor = "temperature" in caps or "humidity" in caps
+                has_power = "power" in caps
+                for name in ("power", "temperature", "humidity"):
+                    capability = caps.get(name)
+                    if not capability:
+                        if name == "power" and not has_sensor:
+                            capability = {"siid": 2, "piid": 1}
+                        elif name == "temperature" and not has_power:
+                            capability = {"siid": 2, "piid": 1}
+                        elif name == "humidity" and not has_power:
+                            capability = {"siid": 2, "piid": 2}
+                    if not capability:
+                        continue
+                    props.append(
+                        {
+                            "did": did,
+                            "siid": int(capability.get("siid", 2)),
+                            "piid": int(capability.get("piid", 1)),
+                        }
+                    )
+                    prop_names.append(name)
+                if not props:
+                    props = [{"did": did, "siid": 2, "piid": 1}]
+                    prop_names = ["power"]
+
+                result = api.get_devices_prop(props)
+                entry: dict[str, Any] = {"did": did, "online_status": "online"}
+                if isinstance(result, list):
+                    for name, item in zip(prop_names, result):
+                        value = item.get("value") if isinstance(item, dict) else None
+                        if name == "power":
+                            entry["power"] = (
+                                "on"
+                                if value is True
+                                else "off" if value is False else "unknown"
+                            )
+                        elif name in {"temperature", "humidity"}:
+                            with contextlib.suppress(TypeError, ValueError):
+                                entry[name] = float(value)
+                entry.setdefault("power", "unknown")
+                results.append(entry)
+            except Exception as exc:
+                results.append(
+                    {
+                        "did": did,
+                        "error": str(exc),
+                        "online_status": "offline",
+                    }
+                )
+        return {"results": results}
     finally:
         _cleanup_runtime_auth(api)
 
