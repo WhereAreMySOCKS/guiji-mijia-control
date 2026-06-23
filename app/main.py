@@ -2,6 +2,7 @@ import asyncio
 import base64
 import contextlib
 import os
+import re
 import secrets
 import threading
 import time
@@ -26,6 +27,9 @@ AUTH_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="guiji-mijia-control")
 login_sessions: dict[str, dict[str, Any]] = {}
+MIOT_DEVICE_TYPE_RE = re.compile(r"urn:miot-spec-v2:device:([^:]+):")
+SENSOR_DEVICE_TYPES = {"temperature-humidity-sensor", "temperature-sensor", "humidity-sensor"}
+SUPPORTED_DEVICE_KINDS = {"plug", "temperature_sensor", "humidity_sensor"}
 
 
 class CredentialsPayload(BaseModel):
@@ -166,10 +170,49 @@ def _is_ble_device(raw: dict[str, Any]) -> bool:
     return any(m in model for m in ble_models)
 
 
+def _find_miot_device_type(value: Any) -> str | None:
+    """Return the MIoT device category from a MIoT spec URN when present."""
+    if isinstance(value, str):
+        match = MIOT_DEVICE_TYPE_RE.search(value)
+        return match.group(1) if match else None
+    if isinstance(value, dict):
+        for key in ("type", "miot_type", "spec_type", "device_type", "urn"):
+            category = _find_miot_device_type(value.get(key))
+            if category:
+                return category
+        for item in value.values():
+            category = _find_miot_device_type(item)
+            if category:
+                return category
+    if isinstance(value, list):
+        for item in value:
+            category = _find_miot_device_type(item)
+            if category:
+                return category
+    return None
+
+
+def _looks_like_plug(raw: dict[str, Any]) -> bool:
+    text = " ".join(
+        str(raw.get(key) or "").lower()
+        for key in ("name", "model", "type", "miot_type", "spec_type", "device_type")
+    )
+    return any(marker in text for marker in ("plug", "outlet", "socket", "插座", "插排"))
+
+
+def _looks_like_sensor(raw: dict[str, Any]) -> bool:
+    text = " ".join(
+        str(raw.get(key) or "").lower()
+        for key in ("name", "model", "type", "miot_type", "spec_type", "device_type")
+    )
+    return any(marker in text for marker in ("sensor_ht", "温湿", "温度", "湿度"))
+
+
 def _classify_device(raw: dict[str, Any], spec: dict[str, Any] | None = None) -> tuple[str, dict[str, Any]]:
     name = str(raw.get("name") or "").lower()
     model = str(raw.get("model") or "").lower()
     is_ble = _is_ble_device(raw)
+    miot_device_type = _find_miot_device_type(spec) or _find_miot_device_type(raw)
     capabilities: dict[str, Any] = {}
 
     services = []
@@ -201,18 +244,23 @@ def _classify_device(raw: dict[str, Any], spec: dict[str, Any] | None = None) ->
             if "humidity" in prop_type:
                 capabilities.setdefault("humidity", {"siid": siid, "piid": piid})
 
+    capabilities["_meta"] = {}
+    if miot_device_type:
+        capabilities["_meta"]["miot_device_type"] = miot_device_type
+        capabilities["_meta"]["miot_type"] = _find_miot_device_type(spec) or _find_miot_device_type(raw)
+
     # BLE sensors use piid 1001+ range (e.g. vchon.sensor_ht.mbs17: temp=1001, hum=1002)
     ble_temp_piid = 1001
     ble_hum_piid = 1002
 
-    if "power" in capabilities or "plug" in model or "插座" in name:
+    if miot_device_type == "outlet" or (miot_device_type is None and _looks_like_plug(raw)):
         capabilities.setdefault("power", {"siid": 2, "piid": 1})
         return "plug", capabilities
-    if "temperature" in capabilities or "sensor_ht" in model or "温湿" in name or "温度" in name:
+    if miot_device_type in SENSOR_DEVICE_TYPES or (miot_device_type is None and _looks_like_sensor(raw)):
         capabilities.setdefault("temperature", {"siid": 2, "piid": ble_temp_piid if is_ble else 1})
         capabilities.setdefault("humidity", {"siid": 2, "piid": ble_hum_piid if is_ble else 2})
         return "temperature_sensor", capabilities
-    if "humidity" in capabilities or "湿度" in name:
+    if miot_device_type is None and ("humidity" in capabilities or "湿度" in name):
         capabilities.setdefault("humidity", {"siid": 2, "piid": 1})
         return "humidity_sensor", capabilities
     return "unknown", capabilities
@@ -475,8 +523,13 @@ async def list_devices(req: DeviceListRequest):
                 with contextlib.suppress(Exception):
                     spec = api.get_device_info(model)
             kind, capabilities = _classify_device(raw, spec)
+            if kind not in SUPPORTED_DEVICE_KINDS:
+                continue
             supports_wifi = _supports_wifi(raw, kind)
-            capabilities["_meta"] = {"supports_wifi": supports_wifi is not False}
+            capabilities["_meta"] = {
+                **(capabilities.get("_meta") if isinstance(capabilities.get("_meta"), dict) else {}),
+                "supports_wifi": supports_wifi is not False,
+            }
             normalized.append(
                 {
                     "external_device_id": raw.get("did"),
